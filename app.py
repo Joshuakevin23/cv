@@ -117,6 +117,11 @@ frame_skip = st.sidebar.slider("Frame Skip Rate", min_value=1, max_value=10, val
 # Input Mode Selector
 input_mode = st.sidebar.selectbox("Select Input Source", ("Demo Video", "Image Upload", "Video Upload"))
 
+# Video Looping Option
+loop_video = False
+if input_mode in ("Demo Video", "Video Upload"):
+    loop_video = st.sidebar.checkbox("Loop Video Stream", value=True, help="Continuously loop the video playback to simulate a live stream.")
+
 # Model dimensions
 stride = 32  # Enforce 32 to satisfy backbone downsampling requirements and avoid shape mismatches
 img_size = 640  # Standard input resolution
@@ -198,27 +203,33 @@ else:
                 st.markdown(f"""
                     <div class="alert-container-critical">
                         <div class="alert-text-crit">🚨 CRITICAL ALERT: OCCUPANCY LIMIT EXCEEDED!</div>
-                        <div style="color: #922B21; margin-top: 5px;">
-                            People Count: <b>{count}</b> | Limit set to: <b>{count_limit}</b> (Exceeded by {count - count_limit})
-                        </div>
                     </div>
                 """, unsafe_allow_html=True)
             else:
                 st.markdown(f"""
                     <div class="alert-container-safe">
                         <div class="alert-text-safe">✅ Safe Occupancy Zone</div>
-                        <div style="color: #196F3D; margin-top: 5px;">
-                            People Count: <b>{count}</b> | Limit set to: <b>{count_limit}</b>
-                        </div>
                     </div>
                 """, unsafe_allow_html=True)
+            
+            # Display Dashboard Metrics
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                st.metric(
+                    label="Current Occupants",
+                    value=count,
+                    delta=f"{count - count_limit} over limit" if count > count_limit else f"{count_limit - count} remaining",
+                    delta_color="inverse" if count > count_limit else "normal"
+                )
+            with col_m2:
+                st.metric(label="Safety Limit", value=count_limit)
             
             # Display Images side by side
             col1, col2 = st.columns(2)
             with col1:
-                st.image(image, caption="Original Uploaded Image", use_column_width=True)
+                st.image(image, caption="Original Uploaded Image", use_container_width=True)
             with col2:
-                st.image(annotated_img, caption="Detections (YOLO-CROWD)", use_column_width=True)
+                st.image(annotated_img, caption="Detections (YOLO-CROWD)", use_container_width=True)
 
     elif input_mode == "Video Upload" or input_mode == "Demo Video":
         if input_mode == "Demo Video":
@@ -255,8 +266,8 @@ else:
         start_btn = st.button("▶️ Run Video Analysis")
         stop_btn = st.sidebar.button("⏹️ Stop Stream")
         
-        # Display Areas
-        col_video, col_stats = st.columns([2, 1])
+        # Display Areas (Responsive Layout)
+        col_video, col_stats = st.columns([3, 2])
         with col_video:
             video_placeholder = st.empty()
         with col_stats:
@@ -272,7 +283,11 @@ else:
             while cap.isOpened() and not stop_btn:
                 ret, frame = cap.read()
                 if not ret:
-                    break
+                    if loop_video:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
+                    else:
+                        break
                     
                 frame_idx += 1
                 
@@ -291,11 +306,24 @@ else:
                 counts_history.append(count)
                 
                 # Update Video Display
-                video_placeholder.image(annotated_frame, caption=f"Processing Frame {frame_idx}/{total_frames}", use_column_width=True)
+                video_placeholder.image(annotated_frame, caption=f"Processing Frame {frame_idx}/{total_frames}", use_container_width=True)
                 
                 # Update Progress
                 progress_val = min(float(frame_idx) / total_frames, 1.0)
                 progress_bar.progress(progress_val)
+                
+                # Update Metrics Dashboard
+                with metric_placeholder.container():
+                    col_m1, col_m2 = st.columns(2)
+                    with col_m1:
+                        st.metric(
+                            label="Current Occupants",
+                            value=count,
+                            delta=f"{count - count_limit} over limit" if count > count_limit else f"{count_limit - count} remaining",
+                            delta_color="inverse" if count > count_limit else "normal"
+                        )
+                    with col_m2:
+                        st.metric(label="Safety Limit", value=count_limit)
                 
                 # Live Warning Logic
                 if count > count_limit:
@@ -303,9 +331,7 @@ else:
                         <div class="alert-container-critical">
                             <div class="alert-text-crit">🚨 CRITICAL WARNING</div>
                             <div style="color: #922B21; font-size: 1.1rem; margin-top: 5px;">
-                                Threshold exceeded!<br/>
-                                Current Occupants: <b>{count}</b><br/>
-                                Safety Limit: <b>{count_limit}</b>
+                                Occupancy limit exceeded!
                             </div>
                         </div>
                     """, unsafe_allow_html=True)
@@ -314,8 +340,7 @@ else:
                         <div class="alert-container-safe">
                             <div class="alert-text-safe">✅ Zone Safe</div>
                             <div style="color: #196F3D; font-size: 1.1rem; margin-top: 5px;">
-                                Occupants: <b>{count}</b><br/>
-                                Limit set to: <b>{count_limit}</b>
+                                Occupancy is within limits.
                             </div>
                         </div>
                     """, unsafe_allow_html=True)
