@@ -96,6 +96,18 @@ except Exception as e:
     st.error(f"Error loading model: {e}")
     model_loaded = False
 
+# Initialize Session State for Persistent Analytics
+if "counts_history" not in st.session_state:
+    st.session_state.counts_history = []
+if "peak_occupancy" not in st.session_state:
+    st.session_state.peak_occupancy = 0
+if "total_violations" not in st.session_state:
+    st.session_state.total_violations = 0
+if "violation_logs" not in st.session_state:
+    st.session_state.violation_logs = []
+if "current_count" not in st.session_state:
+    st.session_state.current_count = 0
+
 # ----------------- Sidebar Controls -----------------
 st.sidebar.header("⚙️ System Configuration")
 
@@ -115,7 +127,22 @@ iou_thres = st.sidebar.slider("NMS IoU Threshold", min_value=0.05, max_value=1.0
 frame_skip = st.sidebar.slider("Frame Skip Rate", min_value=1, max_value=10, value=2, step=1, help="Process every N-th frame to skip redundant frames and speed up inference")
 
 # Input Mode Selector
-input_mode = st.sidebar.selectbox("Select Input Source", ("Demo Video", "Image Upload", "Video Upload"))
+input_mode = st.sidebar.selectbox("Select Input Source", ("Demo Video", "Image Upload", "Video Upload", "IP Camera (RTSP)"))
+
+# IP Camera RTSP Config
+rtsp_url = ""
+if input_mode == "IP Camera (RTSP)":
+    st.sidebar.subheader("🔌 IP Camera Settings")
+    rtsp_url = st.sidebar.text_input(
+        "RTSP Stream URL",
+        value="rtsp://admin:admin123@192.168.1.100:554/cam/realmonitor?channel=1&subtype=1",
+        help="Format: rtsp://username:password@ip_address:port/cam/realmonitor?channel=1&subtype=1"
+    )
+    st.sidebar.info(
+        "💡 **CP Plus Format Guide**:\n"
+        "`rtsp://<user>:<pass>@<ip>:554/cam/realmonitor?channel=1&subtype=1`\n\n"
+        "*Note: subtype=1 targets the sub-stream for lower latency & faster inference.*"
+    )
 
 # Video Looping Option
 loop_video = False
@@ -135,10 +162,8 @@ def run_inference(image_np, model, device, conf_thres, iou_thres, stride, img_si
     h0, w0 = image_np.shape[:2]
     
     # 1. Image preprocessing (Resize and Pad)
-    # letterbox takes a BGR image by default, but we can pass RGB since letterbox doesn't color swap
     img_padded, ratio, (dw, dh) = letterbox(image_np, new_shape=img_size, auto=True, stride=stride)
     
-    # BGR to RGB (if input was BGR, but we use RGB for Streamlit)
     # Convert HWC to CHW, then to Tensor
     img_tensor = img_padded.transpose(2, 0, 1)
     img_tensor = np.ascontiguousarray(img_tensor)
@@ -174,190 +199,437 @@ def run_inference(image_np, model, device, conf_thres, iou_thres, stride, img_si
         det[:, :4] = scale_coords(img_tensor.shape[2:], det[:, :4], image_np.shape).round()
         count = len(det)
         
-        # Draw bounding boxes (Draw green boxes)
+        # Draw bounding boxes (Draw Coral boxes)
         for *xyxy, conf, cls in det:
-            # We draw on RGB image directly. Red/Coral color for detection box
             color = (255, 99, 71)  # Coral RGB
-            label = f"Face {conf:.2f}"
             plot_one_box(xyxy, annotated_img, label=None, color=color, line_thickness=2)
             
     return count, annotated_img
 
 # ----------------- App Main Logic -----------------
-if not model_loaded:
-    st.warning("Please ensure 'yolo-crowd.pt' is in the project directory.")
-else:
-    if input_mode == "Image Upload":
-        st.subheader("🖼️ Static Image Crowd Analysis")
-        uploaded_file = st.file_uploader("Upload an image...", type=["jpg", "jpeg", "png"])
-        
-        if uploaded_file is not None:
-            image = Image.open(uploaded_file).convert("RGB")
-            image_np = np.array(image)
-            
-            with st.spinner("Analyzing image..."):
-                count, annotated_img = run_inference(image_np, model, device, conf_thres, iou_thres, stride, img_size)
-            
-            # Display Alerts/Aesthetics
-            if count > count_limit:
-                st.markdown(f"""
-                    <div class="alert-container-critical">
-                        <div class="alert-text-crit">🚨 CRITICAL ALERT: OCCUPANCY LIMIT EXCEEDED!</div>
-                    </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown(f"""
-                    <div class="alert-container-safe">
-                        <div class="alert-text-safe">✅ Safe Occupancy Zone</div>
-                    </div>
-                """, unsafe_allow_html=True)
-            
-            # Display Dashboard Metrics
-            col_m1, col_m2 = st.columns(2)
+# Create Tabs for Separate Screens
+tab_monitor, tab_stats = st.tabs(["🎥 Active Security Stream", "📊 Dashboard & Analytics"])
+
+# 1. Dashboard Stats Screen (rendered first so placeholders exist in the context)
+with tab_stats:
+    st.subheader("📊 Session Analytics & Incident Logs")
+    
+    # Structural placeholders for live updates from the video loop
+    stats_metrics_placeholder = st.empty()
+    stats_chart_placeholder = st.empty()
+    stats_log_placeholder = st.empty()
+    
+    # If the video is not actively running, render the static state from session state
+    if st.session_state.counts_history:
+        with stats_metrics_placeholder.container():
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            curr = st.session_state.current_count
             with col_m1:
                 st.metric(
-                    label="Current Occupants",
-                    value=count,
-                    delta=f"{count - count_limit} over limit" if count > count_limit else f"{count_limit - count} remaining",
-                    delta_color="inverse" if count > count_limit else "normal"
+                    label="Last Count",
+                    value=curr,
+                    delta=f"{curr - count_limit} over limit" if curr > count_limit else f"{count_limit - curr} remaining",
+                    delta_color="inverse" if curr > count_limit else "normal"
                 )
             with col_m2:
                 st.metric(label="Safety Limit", value=count_limit)
-            
-            # Display Images side by side
-            col1, col2 = st.columns(2)
-            with col1:
-                st.image(image, caption="Original Uploaded Image", use_container_width=True)
-            with col2:
-                st.image(annotated_img, caption="Detections (YOLO-CROWD)", use_container_width=True)
-
-    elif input_mode == "Video Upload" or input_mode == "Demo Video":
-        if input_mode == "Demo Video":
-            st.subheader("📹 Demo Video Crowd Analysis")
-            video_path = "test22.mp4"
-            if not os.path.exists(video_path):
-                st.error(f"Demo video file '{video_path}' not found in the workspace.")
-                st.info("Please choose 'Video Upload' instead.")
-                st.stop()
+            with col_m3:
+                st.metric(label="Peak Occupancy", value=st.session_state.peak_occupancy)
+            with col_m4:
+                st.metric(label="Total Violations (Frames)", value=st.session_state.total_violations)
+                
+        # Line chart of occupancy trend
+        stats_chart_placeholder.markdown("### 📈 Occupancy Trend History")
+        stats_chart_placeholder.line_chart(st.session_state.counts_history)
+        
+        # Incident log
+        stats_log_placeholder.markdown("### 🚨 Safety Warning Incident Log")
+        if st.session_state.violation_logs:
+            stats_log_placeholder.dataframe(st.session_state.violation_logs)
         else:
-            st.subheader("📹 Video Upload Crowd Analysis")
-            uploaded_video = st.file_uploader("Upload a video...", type=["mp4", "avi", "mov"])
-            
-            if uploaded_video is not None:
-                # Save to a temporary file
-                tfile = tempfile.NamedTemporaryFile(delete=False)
-                tfile.write(uploaded_video.read())
-                video_path = tfile.name
-            else:
-                st.info("Please upload an MP4/AVI video file to start.")
-                st.stop()
-                
-        # Load Video Capture
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            st.error("Error opening video stream.")
-            st.stop()
-            
-        # Video Stats
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        st.write(f"Total Video Frames: {total_frames}")
-        
-        # Display Controls and Outputs
-        start_btn = st.button("▶️ Run Video Analysis")
-        stop_btn = st.sidebar.button("⏹️ Stop Stream")
-        
-        # Display Areas (Responsive Layout)
-        col_video, col_stats = st.columns([3, 2])
-        with col_video:
-            video_placeholder = st.empty()
-        with col_stats:
-            alert_placeholder = st.empty()
-            metric_placeholder = st.empty()
-            chart_placeholder = st.empty()
-            
-        if start_btn:
-            progress_bar = st.progress(0)
-            frame_idx = 0
-            counts_history = []
-            
-            while cap.isOpened() and not stop_btn:
-                ret, frame = cap.read()
-                if not ret:
-                    if loop_video:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        continue
-                    else:
-                        break
-                    
-                frame_idx += 1
-                
-                # Skip redundant frames to speed up processing
-                if frame_skip > 1 and frame_idx % frame_skip != 1:
-                    if frame_idx % 5 == 0 or frame_idx == total_frames:
-                        progress_val = min(float(frame_idx) / total_frames, 1.0)
-                        progress_bar.progress(progress_val)
-                    continue
+            stats_log_placeholder.success("✅ No safety limit violations recorded in this session. All clear!")
+    else:
+        stats_metrics_placeholder.info("📊 No Active Monitoring Data. Please go to the 'Active Security Stream' tab and connect the camera feed or analyze an image/video to view analytics.")
 
-                # Convert BGR frame from OpenCV to RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+# 2. Live Monitoring Screen
+with tab_monitor:
+    if not model_loaded:
+        st.warning("Please ensure 'yolo-crowd.pt' is in the project directory.")
+    else:
+        if input_mode == "Image Upload":
+            st.subheader("🖼️ Static Capture Analysis")
+            uploaded_file = st.file_uploader("Upload static camera capture...", type=["jpg", "jpeg", "png"])
+            
+            if uploaded_file is not None:
+                image = Image.open(uploaded_file).convert("RGB")
+                image_np = np.array(image)
                 
-                # Run Model
-                count, annotated_frame = run_inference(frame_rgb, model, device, conf_thres, iou_thres, stride, img_size)
-                counts_history.append(count)
+                with st.spinner("Running model inference..."):
+                    count, annotated_img = run_inference(image_np, model, device, conf_thres, iou_thres, stride, img_size)
                 
-                # Update Video Display
-                video_placeholder.image(annotated_frame, caption=f"Processing Frame {frame_idx}/{total_frames}", use_container_width=True)
-                
-                # Update Progress
-                progress_val = min(float(frame_idx) / total_frames, 1.0)
-                progress_bar.progress(progress_val)
-                
-                # Update Metrics Dashboard
-                with metric_placeholder.container():
-                    col_m1, col_m2 = st.columns(2)
-                    with col_m1:
-                        st.metric(
-                            label="Current Occupants",
-                            value=count,
-                            delta=f"{count - count_limit} over limit" if count > count_limit else f"{count_limit - count} remaining",
-                            delta_color="inverse" if count > count_limit else "normal"
-                        )
-                    with col_m2:
-                        st.metric(label="Safety Limit", value=count_limit)
-                
-                # Live Warning Logic
+                # Update session state for stats tab
+                st.session_state.counts_history = [count]
+                st.session_state.peak_occupancy = count
+                st.session_state.current_count = count
                 if count > count_limit:
-                    alert_placeholder.markdown(f"""
+                    st.session_state.total_violations = 1
+                    timestamp = time.strftime("%H:%M:%S", time.localtime())
+                    st.session_state.violation_logs = [{
+                        "Time/Frame": f"Capture ({timestamp})",
+                        "Occupant Count": count,
+                        "Safety Limit": count_limit,
+                        "Excess": count - count_limit,
+                        "Status": "🚨 Alert"
+                    }]
+                else:
+                    st.session_state.total_violations = 0
+                    st.session_state.violation_logs = []
+                
+                # Display Alert status
+                if count > count_limit:
+                    st.markdown(f"""
                         <div class="alert-container-critical">
-                            <div class="alert-text-crit">🚨 CRITICAL WARNING</div>
-                            <div style="color: #922B21; font-size: 1.1rem; margin-top: 5px;">
-                                Occupancy limit exceeded!
-                            </div>
+                            <div class="alert-text-crit">🚨 CRITICAL WARNING: OCCUPANCY LIMIT EXCEEDED!</div>
                         </div>
                     """, unsafe_allow_html=True)
                 else:
-                    alert_placeholder.markdown(f"""
+                    st.markdown(f"""
                         <div class="alert-container-safe">
-                            <div class="alert-text-safe">✅ Zone Safe</div>
-                            <div style="color: #196F3D; font-size: 1.1rem; margin-top: 5px;">
-                                Occupancy is within limits.
-                            </div>
+                            <div class="alert-text-safe">✅ ZONE STATUS: SAFE</div>
                         </div>
                     """, unsafe_allow_html=True)
                 
-                # Update Stats Graph
-                if frame_idx % 5 == 0 or frame_idx == total_frames:
-                    chart_placeholder.line_chart(counts_history)
-                    
-                # Small sleep to match frame rates
-                time.sleep(0.01)
+                # Quick stats on the monitoring screen
+                col_m1, col_m2 = st.columns(2)
+                with col_m1:
+                    st.metric(
+                        label="Detections",
+                        value=count,
+                        delta=f"{count - count_limit} over limit" if count > count_limit else f"{count_limit - count} remaining",
+                        delta_color="inverse" if count > count_limit else "normal"
+                    )
+                with col_m2:
+                    st.metric(label="Safety Limit", value=count_limit)
                 
-            cap.release()
-            st.success("Video processing completed.")
+                # Show images
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.image(image, caption="Original Capture Feed", use_container_width=True)
+                with col2:
+                    st.image(annotated_img, caption="Processed Detections", use_container_width=True)
+
+        elif input_mode == "Video Upload" or input_mode == "Demo Video":
+            if input_mode == "Demo Video":
+                st.subheader("📹 CCTV Feed Stream (Demo Video)")
+                video_path = "test22.mp4"
+                if not os.path.exists(video_path):
+                    st.error(f"Demo video file '{video_path}' not found in the workspace.")
+                    st.info("Please choose 'Video Upload' instead.")
+                    st.stop()
+            else:
+                st.subheader("📹 Uploaded CCTV Feed Stream")
+                uploaded_video = st.file_uploader("Upload surveillance footage...", type=["mp4", "avi", "mov"])
+                
+                if uploaded_video is not None:
+                    tfile = tempfile.NamedTemporaryFile(delete=False)
+                    tfile.write(uploaded_video.read())
+                    video_path = tfile.name
+                else:
+                    st.info("Please upload an MP4/AVI file to stream.")
+                    st.stop()
+                    
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                st.error("Failed to connect to video feed.")
+                st.stop()
+                
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
-            # Save stats if uploaded video temp file was created
-            if input_mode == "Video Upload" and 'tfile' in locals():
-                try:
-                    os.unlink(tfile.name)
-                except Exception:
-                    pass
+            # Streaming Control Buttons
+            col_b1, col_b2 = st.columns([1, 4])
+            with col_b1:
+                start_btn = st.button("▶️ Connect Stream")
+            with col_b2:
+                stop_btn = st.button("⏹️ Disconnect Stream")
+                
+            # Placeholders for Stream Feed and Alert Status
+            video_placeholder = st.empty()
+            alert_placeholder = st.empty()
+            progress_bar = st.empty()
+            
+            # Display status when stream is idle
+            if not start_btn:
+                video_placeholder.info("Click 'Connect Stream' above to start flowing in the camera stream.")
+                
+            if start_btn:
+                # Reset metrics for the new active session
+                st.session_state.counts_history = []
+                st.session_state.peak_occupancy = 0
+                st.session_state.total_violations = 0
+                st.session_state.violation_logs = []
+                st.session_state.current_count = 0
+                
+                frame_idx = 0
+                progress_bar = st.progress(0)
+                
+                while cap.isOpened() and not stop_btn:
+                    ret, frame = cap.read()
+                    if not ret:
+                        if loop_video:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            continue
+                        else:
+                            break
+                            
+                    frame_idx += 1
+                    
+                    # Skip frames to speed up CPU inference
+                    if frame_skip > 1 and frame_idx % frame_skip != 1:
+                        if frame_idx % 5 == 0 or frame_idx == total_frames:
+                            progress_val = min(float(frame_idx) / total_frames, 1.0)
+                            progress_bar.progress(progress_val)
+                        continue
+                        
+                    # Convert BGR (OpenCV) to RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Run YOLO-CROWD Inference
+                    count, annotated_frame = run_inference(frame_rgb, model, device, conf_thres, iou_thres, stride, img_size)
+                    
+                    # Update State
+                    st.session_state.counts_history.append(count)
+                    st.session_state.current_count = count
+                    if count > st.session_state.peak_occupancy:
+                        st.session_state.peak_occupancy = count
+                        
+                    # Log Safety Exceedance Event
+                    if count > count_limit:
+                        st.session_state.total_violations += 1
+                        timestamp = time.strftime("%H:%M:%S", time.localtime())
+                        st.session_state.violation_logs.append({
+                            "Time/Frame": f"Frame {frame_idx} ({timestamp})",
+                            "Occupant Count": count,
+                            "Safety Limit": count_limit,
+                            "Excess": count - count_limit,
+                            "Status": "🚨 Critical"
+                        })
+                        
+                    # Update Live View (in tab_monitor)
+                    video_placeholder.image(
+                        annotated_frame, 
+                        caption=f"🎥 Live CCTV Stream (Frame {frame_idx}/{total_frames})", 
+                        use_container_width=True
+                    )
+                    
+                    # Update Alert Banner
+                    if count > count_limit:
+                        alert_placeholder.markdown(f"""
+                            <div class="alert-container-critical">
+                                <div class="alert-text-crit">🚨 SAFETY ALERT: OCCUPANCY LIMIT EXCEEDED</div>
+                                <div style="color: #922B21; font-weight: 500; font-size: 1.1rem; margin-top: 5px;">
+                                    Detected {count} people in zone (Limit: {count_limit}). Crowding warning active.
+                                </div>
+                            </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        alert_placeholder.markdown(f"""
+                            <div class="alert-container-safe">
+                                <div class="alert-text-safe">🟢 SYSTEM ONLINE: SAFE OCCUPANCY</div>
+                                <div style="color: #196F3D; font-weight: 500; font-size: 1.1rem; margin-top: 5px;">
+                                    Detected {count} people in zone (Limit: {count_limit}). Safe status.
+                                </div>
+                            </div>
+                        """, unsafe_allow_html=True)
+                        
+                    # Update Progress
+                    progress_val = min(float(frame_idx) / total_frames, 1.0)
+                    progress_bar.progress(progress_val)
+                    
+                    # Update Placeholders in tab_stats (Dashboard & Analytics)
+                    with stats_metrics_placeholder.container():
+                        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                        with col_m1:
+                            st.metric(
+                                label="Current Count",
+                                value=count,
+                                delta=f"{count - count_limit} over limit" if count > count_limit else f"{count_limit - count} remaining",
+                                delta_color="inverse" if count > count_limit else "normal"
+                            )
+                        with col_m2:
+                            st.metric(label="Safety Limit", value=count_limit)
+                        with col_m3:
+                            st.metric(label="Peak Occupancy", value=st.session_state.peak_occupancy)
+                        with col_m4:
+                            st.metric(label="Total Violations (Frames)", value=st.session_state.total_violations)
+                            
+                    stats_chart_placeholder.markdown("### 📈 Occupancy Trend History")
+                    stats_chart_placeholder.line_chart(st.session_state.counts_history)
+                    
+                    stats_log_placeholder.markdown("### 🚨 Safety Warning Incident Log")
+                    if st.session_state.violation_logs:
+                        stats_log_placeholder.dataframe(st.session_state.violation_logs[-10:])
+                    else:
+                        stats_log_placeholder.info("No safety violations recorded in this session.")
+                        
+                    # Minor delay
+                    time.sleep(0.01)
+                    
+                cap.release()
+                st.success("Camera stream session closed.")
+                
+                # Cleanup
+                if input_mode == "Video Upload" and 'tfile' in locals():
+                    try:
+                        os.unlink(tfile.name)
+                    except Exception:
+                        pass
+
+        elif input_mode == "IP Camera (RTSP)":
+            st.subheader("📹 Live IP Camera Stream (RTSP)")
+            
+            if not rtsp_url:
+                st.info("Please configure a valid RTSP Stream URL in the sidebar settings.")
+                st.stop()
+                
+            # Streaming Control Buttons
+            col_b1, col_b2 = st.columns([1, 4])
+            with col_b1:
+                start_btn = st.button("▶️ Connect Camera Feed")
+            with col_b2:
+                stop_btn = st.button("⏹️ Disconnect Camera Feed")
+                
+            # Placeholders for Stream Feed and Alert Status
+            video_placeholder = st.empty()
+            alert_placeholder = st.empty()
+            connection_status = st.empty()
+            
+            # Display status when stream is idle
+            if not start_btn:
+                video_placeholder.info("Click 'Connect Camera Feed' above to start flowing in the IP Camera stream.")
+                
+            if start_btn:
+                # Reset metrics for the new active session
+                st.session_state.counts_history = []
+                st.session_state.peak_occupancy = 0
+                st.session_state.total_violations = 0
+                st.session_state.violation_logs = []
+                st.session_state.current_count = 0
+                
+                connection_status.markdown("⚡ *Connecting to IP Camera stream...*")
+                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                
+                if not cap.isOpened():
+                    connection_status.error("❌ Failed to connect to RTSP stream. Please check camera connection, IP address, and credentials.")
+                    st.stop()
+                    
+                connection_status.success("🟢 Camera Feed Connected successfully.")
+                frame_idx = 0
+                retry_count = 0
+                max_retries = 10
+                
+                while cap.isOpened() and not stop_btn:
+                    ret, frame = cap.read()
+                    if not ret:
+                        retry_count += 1
+                        connection_status.warning(f"⚠️ Video stream frame dropped. Attempting to reconnect ({retry_count}/{max_retries})...")
+                        time.sleep(1.0)
+                        
+                        cap.release()
+                        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                        
+                        if retry_count >= max_retries:
+                            connection_status.error("❌ Live Stream Disconnected. Reconnection limit exceeded.")
+                            break
+                        continue
+                        
+                    retry_count = 0
+                    connection_status.success("🟢 Live Stream Active")
+                    frame_idx += 1
+                    
+                    # Skip frames to prevent inference lag on live stream
+                    if frame_skip > 1 and frame_idx % frame_skip != 1:
+                        continue
+                        
+                    # Convert BGR (OpenCV) to RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Run YOLO-CROWD Inference
+                    count, annotated_frame = run_inference(frame_rgb, model, device, conf_thres, iou_thres, stride, img_size)
+                    
+                    # Update State
+                    st.session_state.counts_history.append(count)
+                    st.session_state.current_count = count
+                    if count > st.session_state.peak_occupancy:
+                        st.session_state.peak_occupancy = count
+                        
+                    # Log Safety Exceedance Event
+                    if count > count_limit:
+                        st.session_state.total_violations += 1
+                        timestamp = time.strftime("%H:%M:%S", time.localtime())
+                        st.session_state.violation_logs.append({
+                            "Time/Frame": f"Stream Time: {timestamp} (Frame {frame_idx})",
+                            "Occupant Count": count,
+                            "Safety Limit": count_limit,
+                            "Excess": count - count_limit,
+                            "Status": "🚨 Critical Warning"
+                        })
+                        
+                    # Update Live View (in tab_monitor)
+                    video_placeholder.image(
+                        annotated_frame, 
+                        caption=f"🎥 Live IP Camera Feed (Frame {frame_idx})", 
+                        use_container_width=True
+                    )
+                    
+                    # Update Alert Banner
+                    if count > count_limit:
+                        alert_placeholder.markdown(f"""
+                            <div class="alert-container-critical">
+                                <div class="alert-text-crit">🚨 SAFETY ALERT: OCCUPANCY LIMIT EXCEEDED</div>
+                                <div style="color: #922B21; font-weight: 500; font-size: 1.1rem; margin-top: 5px;">
+                                    Detected {count} people in zone (Limit: {count_limit}). Crowding warning active!
+                                </div>
+                            </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        alert_placeholder.markdown(f"""
+                            <div class="alert-container-safe">
+                                <div class="alert-text-safe">🟢 SYSTEM ONLINE: SAFE OCCUPANCY</div>
+                                <div style="color: #196F3D; font-weight: 500; font-size: 1.1rem; margin-top: 5px;">
+                                    Detected {count} people in zone (Limit: {count_limit}). Safe status.
+                                </div>
+                            </div>
+                        """, unsafe_allow_html=True)
+                        
+                    # Update Placeholders in tab_stats (Dashboard & Analytics)
+                    with stats_metrics_placeholder.container():
+                        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                        with col_m1:
+                            st.metric(
+                                label="Current Count",
+                                value=count,
+                                delta=f"{count - count_limit} over limit" if count > count_limit else f"{count_limit - count} remaining",
+                                delta_color="inverse" if count > count_limit else "normal"
+                            )
+                        with col_m2:
+                            st.metric(label="Safety Limit", value=count_limit)
+                        with col_m3:
+                            st.metric(label="Peak Occupancy", value=st.session_state.peak_occupancy)
+                        with col_m4:
+                            st.metric(label="Total Violations (Frames)", value=st.session_state.total_violations)
+                            
+                    stats_chart_placeholder.markdown("### 📈 Occupancy Trend History")
+                    stats_chart_placeholder.line_chart(st.session_state.counts_history)
+                    
+                    stats_log_placeholder.markdown("### 🚨 Safety Warning Incident Log")
+                    if st.session_state.violation_logs:
+                        stats_log_placeholder.dataframe(st.session_state.violation_logs[-10:])
+                    else:
+                        stats_log_placeholder.info("No safety violations recorded in this session.")
+                        
+                    # Tiny delay
+                    time.sleep(0.005)
+                    
+                cap.release()
+                connection_status.info("🔌 Live stream disconnected.")
+
